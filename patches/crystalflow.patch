@@ -1,0 +1,113 @@
+diff --git a/diffcsp/pl_modules/flow.py b/diffcsp/pl_modules/flow.py
+index 529f443..7aa977c 100644
+--- a/diffcsp/pl_modules/flow.py
++++ b/diffcsp/pl_modules/flow.py
+@@ -823,8 +823,8 @@ class CSPFlow(BaseModule):
+             batch_size=batch.num_graphs,
+         )
+ 
+-        if loss.isnan():
+-            return None
++        if not torch.isfinite(loss):
++            raise RuntimeError(f"non-finite loss at epoch={self.current_epoch}, batch={batch_idx}: {loss.detach().item()}")
+ 
+         return loss
+ 
+@@ -840,6 +840,7 @@ class CSPFlow(BaseModule):
+             on_epoch=True,
+             prog_bar=True,
+             batch_size=batch.num_graphs,
++            sync_dist=True,  # val_loss drives LR scheduler & ckpt; must agree across DDP ranks
+         )
+         return loss
+ 
+@@ -852,6 +853,7 @@ class CSPFlow(BaseModule):
+         self.log_dict(
+             log_dict,
+             batch_size=batch.num_graphs,
++            sync_dist=True,
+         )
+         return loss
+ 
+diff --git a/diffcsp/run.py b/diffcsp/run.py
+index 0a69716..ac83b80 100644
+--- a/diffcsp/run.py
++++ b/diffcsp/run.py
+@@ -67,6 +67,18 @@ def build_callbacks(cfg: DictConfig) -> List[Callback]:
+                 save_last=cfg.train.model_checkpoints.save_last,
+             )
+         )
++        # Optional periodic snapshots in a subdir (find_ckpt only globs the run dir),
++        # since val_loss does not track generation quality well enough to pick a ckpt.
++        every_n_epochs = cfg.train.model_checkpoints.get("every_n_epochs")
++        if every_n_epochs:
++            hydra.utils.log.info(f"Adding callback <ModelCheckpoint> every {every_n_epochs} epochs")
++            callbacks.append(
++                ModelCheckpoint(
++                    dirpath=None if ckpt_dir is None else str(Path(ckpt_dir) / "periodic"),
++                    save_top_k=-1,
++                    every_n_epochs=every_n_epochs,
++                )
++            )
+ 
+     callbacks.append(
+         TQDMProgressBar(
+@@ -179,7 +191,12 @@ def save_scaler(datamodule, save_dir):
+ 
+ 
+ def find_ckpt(ckpt_dir) -> str | None:
+-    ckpts = list(ckpt_dir.glob('*.ckpt'))
++    # last.ckpt (save_last=true) is the newest state; its name has no epoch to parse
++    if (ckpt_dir / 'last.ckpt').exists():
++        ckpt = str(ckpt_dir / 'last.ckpt')
++        hydra.utils.log.info(f"found checkpoint: {ckpt}")
++        return ckpt
++    ckpts = list(ckpt_dir.glob('epoch=*.ckpt'))
+     if len(ckpts) > 0:
+         ckpt_epochs = np.array([int(ckpt.parts[-1].split('-')[0].split('=')[1]) for ckpt in ckpts])
+         ckpt = str(ckpts[ckpt_epochs.argsort()[-1]])
+@@ -289,7 +306,11 @@ def run(cfg: DictConfig) -> None:
+     log_hyperparameters(trainer=trainer, model=model, cfg=cfg)
+ 
+     hydra.utils.log.info("Starting training!")
+-    ckpt = find_ckpt(run_dir)
++    # Allow a new experiment directory to resume the complete Lightning state
++    # from an earlier run, including optimizer and scheduler state.
++    ckpt = cfg.train.get('resume_from_ckpt') or find_ckpt(run_dir)
++    if ckpt is not None:
++        hydra.utils.log.info(f"Resuming training from checkpoint: {ckpt}")
+     trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt)
+     if not cfg.train.pl_trainer.fast_dev_run:
+         hydra.utils.log.info("Starting testing!")
+diff --git a/scripts/eval_utils.py b/scripts/eval_utils.py
+index a3f639a..b90ca5e 100644
+--- a/scripts/eval_utils.py
++++ b/scripts/eval_utils.py
+@@ -185,6 +185,10 @@ def smact_validity(comp, count,
+     smact_elems = [e[1] for e in space.items()]
+     electronegs = [e.pauling_eneg for e in smact_elems]
+     ox_combos = [e.oxidation_states for e in smact_elems]
++    # SMACT 4.0 uses None for elements without oxidation-state data.
++    # Preserve evaluation by treating such compositions as unknown-validity.
++    if any(not states for states in ox_combos):
++        return True
+     if len(set(elem_symbols)) == 1:
+         return True
+     if include_alloys:
+@@ -204,8 +208,15 @@ def smact_validity(comp, count,
+     for ox_states in itertools.product(*ox_combos):
+         stoichs = [(c,) for c in count]
+         # Test for charge balance
+-        cn_e, cn_r = smact.neutral_ratios(
++        neutral = smact.neutral_ratios(
+             ox_states, stoichs=stoichs, threshold=threshold)
++        # SMACT <=3 returned (valid_ratios, all_ratios); SMACT 4 returns
++        # the valid-ratios list directly. Support both APIs.
++        if isinstance(neutral, tuple) and len(neutral) == 2 and all(
++                isinstance(x, (list, tuple)) for x in neutral):
++            cn_e, cn_r = neutral
++        else:
++            cn_e, cn_r = neutral, None
+         # Electronegativity test
+         if cn_e:
+             if use_pauling_test:

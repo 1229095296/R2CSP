@@ -1,0 +1,23 @@
+_target_: diffcsp.pl_modules.r2csp.R2CSPNet
+hidden_dim: 512
+latent_dim: 0
+lattice_dim: 9
+max_atoms: 100
+num_layers: 6
+act_fn: silu
+dis_emb: sin
+num_freqs: 128
+rec_emb: none
+num_millers: 5
+edge_style: fc
+max_neighbors: ${model.max_neighbors}
+cutoff: ${model.radius}
+ln: true
+ip: true
+# R2CSPNet (all off: the network equals cspnet.yaml). Paper model: use_attention=true, num_heads=1, attn_last_k=1
+use_attention: false
+num_heads: 1
+attn_last_k: 0  # softmax gain in the last k layers; 0 = every layer
+noself_last_k: 0  # mean over j != i in the last k layers (self-edge ablation)
+attn_dist_bias: false  # logit += g(h_i) * -log(d_ij / d_min(i)), zero-initialized gate g
+attn_logn_scale: false  # logit *= log N
